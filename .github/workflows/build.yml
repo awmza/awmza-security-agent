@@ -8,6 +8,11 @@ on:
     tags: [agent-v*]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a GitHub release with this tag (e.g. agent-v1.1.0); empty = build only"
+        required: false
+        default: ""
 permissions:
   contents: read
 env:
@@ -121,7 +126,11 @@ jobs:
           cd rel && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@v4
         with: {name: agent-release, path: rel/, if-no-files-found: error}
-      - name: Publish GitHub release (tags agent-v* only)
-        if: startsWith(github.ref, 'refs/tags/agent-v')
-        env: {GH_TOKEN: "${{ github.token }}"}
-        run: gh release create "$GITHUB_REF_NAME" rel/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes "AWMZA Security agent. Verify files with SHA256SUMS."
+      - name: Publish GitHub release (agent-v* tag push, or release_tag on a manual run)
+        if: startsWith(github.ref, 'refs/tags/agent-v') || startsWith(inputs.release_tag, 'agent-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" rel/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" \
+            --notes "AWMZA Security agent. Verify files with SHA256SUMS. Windows signing: SignPath Foundation (pending)."
