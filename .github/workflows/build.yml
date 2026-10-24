@@ -1,0 +1,127 @@
+# Builds the AWMZA Security agent on real Windows, macOS and Linux runners,
+# tests each build, and collects the files + SHA256SUMS in one "agent-release" artifact.
+# Code signing (SignPath) runs only once the SIGNPATH_* settings exist in the repository.
+name: build
+on:
+  push:
+    branches: ["**"]
+    tags: [agent-v*]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  PYINSTALLER: pyinstaller==6.11.1
+  BAD_TOKEN: awe_ci_wrong_token
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Build agent (PyInstaller) and setup (Inno Setup)
+        run: |
+          python -m pip install --disable-pip-version-check $env:PYINSTALLER
+          python -m PyInstaller --noconfirm --clean --onedir --console --name awmza-agent `
+            --version-file windows/version.txt awmza-agent.py
+          if (!(Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          Copy-Item windows/setup.iss setup.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-ChildItem out
+      - name: Test silent install, wrong token, Program Files guard, uninstall
+        run: |
+          Start-Process .\out\AWMZA-Security-Setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES',"/TOKEN=$env:BAD_TOKEN",'/LOG=setup.log' -Wait
+          $exe = "$env:ProgramFiles\AWMZA Security\awmza-agent.exe"
+          if (!(Test-Path $exe)) { throw "agent exe not installed" }
+          & $exe --help; if ($LASTEXITCODE -ne 0) { throw "--help failed" }
+          $out = & $exe install --token $env:BAD_TOKEN 2>&1 | Out-String
+          Write-Output $out
+          if ($out -notmatch 'token is wrong or expired') { throw "unexpected install result" }
+          Copy-Item "$env:ProgramFiles\AWMZA Security" "$env:TEMP\awmzacopy" -Recurse
+          $out = & "$env:TEMP\awmzacopy\awmza-agent.exe" install --token awe_x 2>&1 | Out-String
+          if ($out -notmatch 'Program Files') { throw "Program Files guard missing" }
+          Start-Process "$env:ProgramFiles\AWMZA Security\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
+          Start-Sleep 5
+          if (Test-Path $exe) { throw "agent not removed" }
+          exit 0
+      - id: up
+        uses: actions/upload-artifact@v4
+        with: {name: agent-windows, path: out/AWMZA-Security-Setup.exe, if-no-files-found: error}
+      - name: Sign with SignPath (only when configured)
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.up.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+      - name: Upload signed setup
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with: {name: agent-windows-signed, path: signed/, if-no-files-found: error}
+
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, file: awmza-agent-macos-arm64}
+          - {os: macos-15-intel, file: awmza-agent-macos-x86_64}
+          - {os: ubuntu-22.04, file: awmza-agent-linux-x86_64}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Build single-file binary
+        run: |
+          python -m pip install --disable-pip-version-check "$PYINSTALLER"
+          python -m PyInstaller --noconfirm --clean --onefile --console --name "${{ matrix.file }}" awmza-agent.py
+          file "dist/${{ matrix.file }}"
+      - name: macOS signature check (ad-hoc, needed on Apple silicon)
+        if: runner.os == 'macOS'
+        run: codesign --verify --verbose=2 "dist/${{ matrix.file }}"
+      - name: Test help, status, wrong token, install.sh checksum guard
+        run: |
+          B="dist/${{ matrix.file }}"
+          "$B" --help
+          "$B" status
+          out=$(sudo "$B" install --token "$BAD_TOKEN" 2>&1 || true); echo "$out"
+          echo "$out" | grep -q 'token is wrong or expired'
+          sh -n unix/install.sh
+          mkdir -p srv && cp "$B" srv/ && echo "0000  ${{ matrix.file }}" > srv/SHA256SUMS
+          out=$(sudo env AWMZA_AGENT_BASE="file://$PWD/srv" sh unix/install.sh 2>&1 || true); echo "$out"
+          echo "$out" | grep -q 'SHA-256 check failed'
+      - uses: actions/upload-artifact@v4
+        with: {name: "agent-${{ matrix.file }}", path: "dist/${{ matrix.file }}", if-no-files-found: error}
+
+  release:
+    needs: [windows, unix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {path: art}
+      - name: Collect files and SHA256SUMS
+        run: |
+          mkdir rel
+          if [ -d art/agent-windows-signed ]; then cp art/agent-windows-signed/*.exe rel/; else cp art/agent-windows/*.exe rel/; fi
+          cp art/agent-awmza-agent-*/awmza-agent-* rel/
+          cp unix/install.sh awmza-agent.py rel/
+          cd rel && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with: {name: agent-release, path: rel/, if-no-files-found: error}
+      - name: Publish GitHub release (tags agent-v* only)
+        if: startsWith(github.ref, 'refs/tags/agent-v')
+        env: {GH_TOKEN: "${{ github.token }}"}
+        run: gh release create "$GITHUB_REF_NAME" rel/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes "AWMZA Security agent. Verify files with SHA256SUMS."
