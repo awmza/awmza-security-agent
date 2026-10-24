@@ -13,6 +13,13 @@ The service behind it (dashboard, alerts, reports) is a paid product; this agent
 
 **No file content ever leaves the computer.** See [PRIVACY.md](PRIVACY.md).
 
+## Download
+Releases with SHA256SUMS: https://github.com/awmza/awmza-security-agent/releases
+(also served at https://security.awmza.com/agent/).
+
+Free code signing for the Windows files is provided by [SignPath.io](https://about.signpath.io/),
+certificate by [SignPath Foundation](https://signpath.org/) (pending acceptance; see [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)).
+
 ## Install
 Make an install token in the dashboard (Endpoints > Add computer), then:
 
